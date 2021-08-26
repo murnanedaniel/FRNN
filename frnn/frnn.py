@@ -43,7 +43,7 @@ class _frnn_grid_points(Function):
         N = points1.shape[0]
         D = points1.shape[2]
         # assert D == 2 or D == 3, "For now only 2D/3D is supported"
-        assert D >= 2 and D <= 16, "For now 2 <= D <= 16"
+        # assert D >= 2 and D <= 32
         # setup grid params
         # for D > 3, still use 3D grid
         # TODO: use PCA
@@ -52,16 +52,18 @@ class _frnn_grid_points(Function):
             grid_params_size = 8
             grid_delta_idx = 3
             grid_total_idx = 7
-            grid_max_res = 128
+            grid_max_res = 64
             grid_dim = 3
         else:
             # 0-1 grid_min; 2 grid_delta; 3-4 grid_res; 5 grid_total
             grid_params_size = 6
             grid_delta_idx = 2
             grid_total_idx = 5
-            grid_max_res = 1024
+            grid_max_res = 512
             grid_dim = 2
 
+        K_val = torch.tensor(K)
+        
         if not use_cached_grid:
             # create grid from scratch
             # TODO: use struct of array instead of array of struct?
@@ -75,12 +77,13 @@ class _frnn_grid_points(Function):
                 grid_params_cuda[i, :grid_delta_idx] = grid_min
                 grid_size = grid_max - grid_min
                 cell_size = r[i].item() / radius_cell_ratio
-                if cell_size < grid_size.min() / grid_max_res:
-                    cell_size = grid_size.min() / grid_max_res
+                if cell_size < grid_size.max() / grid_max_res:
+                    cell_size = grid_size.max() / grid_max_res
                 grid_params_cuda[i, grid_delta_idx] = 1 / cell_size
                 grid_params_cuda[i, grid_delta_idx +
                                  1:grid_total_idx] = torch.floor(
                                      grid_size / cell_size) + 1
+                #print(grid_params_cuda[i, grid_delta_idx + 1:grid_total_idx])
                 grid_params_cuda[i, grid_total_idx] = torch.prod(
                     grid_params_cuda[i, grid_delta_idx + 1:grid_total_idx])
                 if G < grid_params_cuda[i, grid_total_idx]:
@@ -101,7 +104,8 @@ class _frnn_grid_points(Function):
                                       device=points1.device)
             _C.insert_points_cuda(points2, lengths2, grid_params_cuda,
                                   pc2_grid_cnt, pc2_grid_cell, pc2_grid_idx, G)
-
+            
+            
             # compute the offset for each grid
             # pc2_grid_off = _C.prefix_sum_cuda(pc2_grid_cnt, grid_params_cuda.cpu())
 
@@ -125,11 +129,54 @@ class _frnn_grid_points(Function):
             _C.counting_sort_cuda(points2, lengths2, pc2_grid_cell,
                                   pc2_grid_idx, pc2_grid_off, sorted_points2,
                                   sorted_points2_idxs)
-
+            
+            
+            
+            #check if K is not set
+            if K == -1:
+            
+                #find query indices in densest cell and retrieve query points
+                query_idxs = torch.where(pc2_grid_cell == torch.argmax(pc2_grid_cnt))[1]
+                query = points2[:,query_idxs]
+                
+                Q = query.shape[1]
+            
+                q_lengths = torch.full((query.shape[0],),
+                              Q,
+                              dtype=torch.long,
+                              device=query.device)
+            
+                sorted_query_idxs = sorted_points2_idxs[:,query_idxs][0]
+                
+                #find indices of sorted points relative to query set
+                arg = torch.sort(sorted_query_idxs)[1].unsqueeze(0).type(torch.int32)
+                
+                #retrieve query points in sorted order
+                sorted_query_idxs_temp = sorted_query_idxs.type(torch.LongTensor)
+                sorted_query = sorted_points2[:,sorted_query_idxs_temp]
+                
+                #find nearest neighbors
+                idxs, dists = _C.find_nbrs_cuda(sorted_query, sorted_points2,
+                                        q_lengths, lengths2, pc2_grid_off,
+                                        arg,
+                                        sorted_points2_idxs, grid_params_cuda,
+                                        5000, r, r * r)
+            
+                
+                
+                idxs = idxs.squeeze() 
+                
+                #set K value to the maximum number of neighbors found for an index
+                positive_idxs = idxs >= 0
+                K_val = torch.sum(positive_idxs, dim=1).max()
+                K = K_val.cpu().numpy()
+    
+            
         assert (sorted_points2 is not None and pc2_grid_off is not None and
                 sorted_points2_idxs is not None and
                 grid_params_cuda is not None)
 
+        
         G = pc2_grid_off.shape[1]
 
         # also sort the points1 for faster search
@@ -191,9 +238,9 @@ class _frnn_grid_points(Function):
         ctx.mark_non_differentiable(pc2_grid_off)
         ctx.mark_non_differentiable(sorted_points2_idxs)
         ctx.mark_non_differentiable(grid_params_cuda)
-
+       
         return (idxs, dists, sorted_points2, pc2_grid_off, sorted_points2_idxs,
-                grid_params_cuda)
+                grid_params_cuda, K_val)
 
     @staticmethod
     @once_differentiable
@@ -289,15 +336,14 @@ def frnn_grid_points(
         )
     # if points1.shape[2] != 2 and points1.shape[2] != 3:
     #     raise ValueError("for now only grid in 2D/3D is supported")
-    if points1.shape[2] < 2 or points1.shape[2] > 16:
-        raise ValueError(
-            "for now only point clouds of dimension 2-16 is supported")
+    # if points1.shape[2] < 2 or points1.shape[2] > 32:
+    #     raise ValueError(
+    #         "for now only point clouds of dimension 2-32 is supported")
     if not points1.is_cuda or not points2.is_cuda:
         raise TypeError("for now only cuda version is supported")
 
     points1 = points1.contiguous()
     points2 = points2.contiguous()
-
     P1 = points1.shape[1]
     P2 = points2.shape[1]
 
@@ -313,7 +359,9 @@ def frnn_grid_points(
                               device=points2.device)
 
     N = points1.shape[0]
-    if isinstance(r, float):
+    
+    
+    if isinstance(r, float) or isinstance(r, int):
         r = torch.ones((N,), dtype=torch.float32) * r
     if isinstance(r, torch.Tensor):
         assert (len(r.shape) == 1 and (r.shape[0] == 1 or r.shape[0] == N))
@@ -324,11 +372,11 @@ def frnn_grid_points(
         r = r.cuda()
 
     if grid is not None:
-        idxs, dists, sorted_points2, pc2_grid_off, sorted_points2_idxs, grid_params_cuda = _frnn_grid_points.apply(
+        idxs, dists, sorted_points2, pc2_grid_off, sorted_points2_idxs, grid_params_cuda, K_val = _frnn_grid_points.apply(
             points1, points2, lengths1, lengths2, K, r, grid[0], grid[1],
             grid[2], grid[3], return_sorted, radius_cell_ratio)
     else:
-        idxs, dists, sorted_points2, pc2_grid_off, sorted_points2_idxs, grid_params_cuda = _frnn_grid_points.apply(
+        idxs, dists, sorted_points2, pc2_grid_off, sorted_points2_idxs, grid_params_cuda, K_val = _frnn_grid_points.apply(
             points1, points2, lengths1, lengths2, K, r, None, None, None, None,
             return_sorted, radius_cell_ratio)
 
@@ -344,7 +392,7 @@ def frnn_grid_points(
 
     # follow pytorch3d.ops.knn_points' conventions to return dists frist
     # TODO: also change this in the c++/cuda code?
-    return dists, idxs, points2_nn, grid
+    return dists, idxs, points2_nn, grid, K_val
 
 
 # TODO: probably do this in cuda?
